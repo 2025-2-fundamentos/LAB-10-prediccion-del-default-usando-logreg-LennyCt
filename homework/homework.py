@@ -45,53 +45,124 @@
 # - Para la columna EDUCATION, valores > 4 indican niveles superiores
 #   de educación, agrupe estos valores en la categoría "others".
 #
-# Renombre la columna "default payment next month" a "default"
-# y remueva la columna "ID".
-#
-#
-# Paso 2.
-# Divida los datasets en x_train, y_train, x_test, y_test.
-#
-#
-# Paso 3.
-# Cree un pipeline para el modelo de clasificación. Este pipeline debe
-# contener las siguientes capas:
-# - Transforma las variables categoricas usando el método
-#   one-hot-encoding.
-# - Escala las demas variables al intervalo [0, 1].
-# - Selecciona las K mejores caracteristicas.
-# - Ajusta un modelo de regresion logistica.
-#
-#
-# Paso 4.
-# Optimice los hiperparametros del pipeline usando validación cruzada.
-# Use 10 splits para la validación cruzada. Use la función de precision
-# balanceada para medir la precisión del modelo.
-#
-#
-# Paso 5.
-# Guarde el modelo (comprimido con gzip) como "files/models/model.pkl.gz".
-# Recuerde que es posible guardar el modelo comprimido usanzo la libreria gzip.
-#
-#
-# Paso 6.
-# Calcule las metricas de precision, precision balanceada, recall,
-# y f1-score para los conjuntos de entrenamiento y prueba.
-# Guardelas en el archivo files/output/metrics.json. Cada fila
-# del archivo es un diccionario con las metricas de un modelo.
-# Este diccionario tiene un campo para indicar si es el conjunto
-# de entrenamiento o prueba. Por ejemplo:
-#
-# {'type': 'metrics', 'dataset': 'train', 'precision': 0.8, 'balanced_accuracy': 0.7, 'recall': 0.9, 'f1_score': 0.85}
-# {'type': 'metrics', 'dataset': 'test', 'precision': 0.7, 'balanced_accuracy': 0.6, 'recall': 0.8, 'f1_score': 0.75}
-#
-#
-# Paso 7.
-# Calcule las matrices de confusion para los conjuntos de entrenamiento y
-# prueba. Guardelas en el archivo files/output/metrics.json. Cada fila
-# del archivo es un diccionario con las metricas de un modelo.
-# de entrenamiento o prueba. Por ejemplo:
-#
-# {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
-# {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
-#
+
+import os
+import gzip
+import json
+import pickle
+
+import pandas as pd
+import numpy as np
+
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, MinMaxScaler
+from sklearn.impute import SimpleImputer
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import GridSearchCV, StratifiedKFold
+from sklearn.metrics import (
+    precision_score,
+    recall_score,
+    f1_score,
+    balanced_accuracy_score,
+    confusion_matrix,
+)
+
+
+# Paths
+MODEL_PATH = "files/models/model.pkl.gz"
+METRICS_PATH = "files/output/metrics.json"
+TRAIN_PATH = "files/input/train_data.csv.zip"
+TEST_PATH = "files/input/test_data.csv.zip"
+
+
+def load_and_clean(path: str) -> pd.DataFrame:
+    """Load CSV (possibly zipped) and apply required cleaning rules."""
+    # pandas detecta compresión por la extensión .zip si corresponde
+    df = pd.read_csv(path, compression="zip")
+
+    # Renombrar objetivo
+    if "default payment next month" in df.columns:
+        df = df.rename(columns={"default payment next month": "default"})
+
+    # Eliminar ID si existe
+    if "ID" in df.columns:
+        df = df.drop(columns=["ID"])
+
+    # Convertir columnas numéricas esperadas a numéricas (seguridad)
+    for col in ["SEX", "EDUCATION", "MARRIAGE"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # EDUCATION: valores > 4 agrupar en 4 (others)
+    if "EDUCATION" in df.columns:
+        df["EDUCATION"] = df["EDUCATION"].apply(lambda x: 4 if pd.notna(x) and x > 4 else x)
+
+    # Remover registros con información no disponible (NaN)
+    df = df.dropna().reset_index(drop=True)
+
+    # Asegurar target entero 0/1
+    if "default" in df.columns:
+        df["default"] = df["default"].astype(int)
+
+    return df
+
+def save_model_as_pickle_gzip(obj, filepath: str) -> None:
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    with gzip.open(filepath, "wb") as f:
+        pickle.dump(obj, f)
+
+
+def write_metrics_lines(metrics_list, filepath: str) -> None:
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    with open(filepath, "w", encoding="utf-8") as f:
+        for entry in metrics_list:
+            f.write(json.dumps(entry) + "\n")
+
+
+def main():
+    # Carga y limpieza
+    train = load_and_clean(TRAIN_PATH)
+    test = load_and_clean(TEST_PATH)
+
+    # Separar X / y
+    X_train = train.drop(columns=["default"])
+    y_train = train["default"]
+
+    X_test = test.drop(columns=["default"])
+    y_test = test["default"]
+
+    # Definir features categóricas y numéricas explícitamente
+    categorical_features = ["SEX", "EDUCATION", "MARRIAGE"]
+    # todas las demás columnas en X_train que no estén en categóricas (orden estable)
+    numerical_features = [c for c in X_train.columns if c not in categorical_features]
+
+    # Preprocesador:
+    preprocessor = ColumnTransformer(
+        transformers=[
+            (
+                "cat",
+                Pipeline(
+                    steps=[
+                        ("imputer", SimpleImputer(strategy="most_frequent")),
+                        ("ohe", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
+                    ]
+                ),
+                categorical_features,
+            ),
+            (
+                "num",
+                Pipeline(
+                    steps=[
+                        ("imputer", SimpleImputer(strategy="median")),
+                        ("scaler", MinMaxScaler()),
+                    ]
+                ),
+                numerical_features,
+            ),
+        ],
+        remainder="drop",
+    )
+
+
